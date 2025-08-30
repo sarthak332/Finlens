@@ -4,12 +4,12 @@ import express from 'express';
 import cors from 'cors';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import axios from 'axios';
-import * as cheerio from 'cheerio'; // Import cheerio
+import * as cheerio from 'cheerio';
 import dotenv from 'dotenv';
 import mongoose from 'mongoose';
 import jwt from 'jsonwebtoken';
 import User from './models/User.js';
-import Article from './models/Article.js'; // Import the new Article model
+import Article from './models/Article.js';
 
 dotenv.config();
 
@@ -23,13 +23,24 @@ const JWT_SECRET = process.env.JWT_SECRET;
 
 if (!GEMINI_API_KEY || !MONGO_URI || !JWT_SECRET) {
   console.error("Missing required environment variables.");
-  process.exit(1);
+  // Exit the process so Render knows the deployment failed
+  process.exit(1); 
 }
 
 // Connect to MongoDB
 mongoose.connect(MONGO_URI)
-  .then(() => console.log('MongoDB connected successfully.'))
-  .catch(err => console.error('MongoDB connection error:', err));
+  .then(() => {
+    console.log('MongoDB connected successfully.');
+    // Start the server ONLY after the database is connected
+    app.listen(PORT, () => {
+      console.log(`Server is running on http://localhost:${PORT}`);
+    });
+  })
+  .catch(err => {
+    console.error('MongoDB connection error:', err);
+    // Exit the process so Render knows the deployment failed
+    process.exit(1);
+  });
 
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 
@@ -88,16 +99,6 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// Get a user's saved articles - now protected
-app.get('/api/articles', protect, async (req, res) => {
-  try {
-    const articles = await Article.find({ user: req.user }).sort({ createdAt: -1 });
-    res.json(articles);
-  } catch (error) {
-    res.status(500).json({ message: 'Failed to fetch articles' });
-  }
-});
-
 // API endpoint for summarizing an article - now protected
 app.post('/api/summarize', protect, async (req, res) => {
   const { url } = req.body;
@@ -111,54 +112,62 @@ app.post('/api/summarize', protect, async (req, res) => {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
         'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, compress, deflate, br'
       }
     });
 
     if (response.status !== 200) {
-      throw new Error(`Failed to fetch URL with status code: ${response.status}`);
+        throw new Error(`Failed to fetch URL with status code: ${response.status}`);
     }
-
     const htmlContent = response.data;
     const $ = cheerio.load(htmlContent);
 
+    // This is the core logic that extracts article text.
     let articleText = '';
-    $('p, h1, h2, h3, h4, h5, h6, ul, li').each((i, el) => {
-      articleText += $(el).text() + '\n';
+    $('p, h1, h2, h3, h4, h5, h6').each((i, element) => {
+        articleText += $(element).text() + '\n';
     });
-    
-    // Add sentiment analysis to the prompt
-    const prompt = `Please provide a concise, factual summary and a one-word sentiment analysis (Positive, Negative, or Neutral) of the following article content.
+
+    if (articleText.length < 100) {
+        throw new Error('Could not find enough article text on the page. The URL may not be a news article or the content is being blocked.');
+    }
+
+    const prompt = `Please provide a concise, factual summary of the following article content. Focus on key financial figures, major announcements, and the overall sentiment in a single word (e.g., "Positive", "Negative", "Neutral").
 
     Article Content:
     ${articleText.substring(0, 5000)}
+    
+    Format your response as a JSON object with 'summary' and 'sentiment' keys. For example:
+    { "summary": "The article discusses...", "sentiment": "Positive" }
     `;
 
     const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
     const result = await model.generateContent(prompt);
-    const aiResponse = result.response.text();
+    const text = result.response.text();
+    const parsedData = JSON.parse(text);
 
-    const summary = aiResponse.substring(0, aiResponse.lastIndexOf('Sentiment:')).trim();
-    const sentiment = aiResponse.substring(aiResponse.lastIndexOf('Sentiment:') + 10).trim();
-
-    // Create and save the new article
-    const newArticle = new Article({
-      user: req.user,
+    // Save the article to the database
+    const newArticle = await Article.create({
       url,
-      summary,
-      sentiment
+      summary: parsedData.summary,
+      sentiment: parsedData.sentiment,
+      user: req.user
     });
 
-    await newArticle.save();
-
-    res.json({ summary, sentiment });
+    res.json(parsedData);
 
   } catch (error) {
-    console.error('Error during summarization:', error);
-    res.status(500).json({ error: 'Failed to process article. The website may be blocking requests or the content is not a valid article. Please try a different URL.' });
+    console.error('Error during summarization:', error.message);
+    res.status(500).json({ error: 'Failed to process article. The website may be blocking requests. Please try a different URL.' });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Server is running on http://localhost:${PORT}`);
+app.get('/api/articles', protect, async (req, res) => {
+  try {
+    const articles = await Article.find({ user: req.user }).sort({ createdAt: -1 });
+    res.json(articles);
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
 });
 
